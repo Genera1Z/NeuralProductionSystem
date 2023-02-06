@@ -1,4 +1,5 @@
 import numpy as np
+import torch as pt
 import torch.utils.data as ptud
 
 
@@ -30,14 +31,14 @@ class CoordinateArithmeticSet(ptud.Dataset):
                 frames.append(frame)
                 operations.append([n1, n2, oidx])
 
-            self.inputs.append(np.array(frames))  # [(t,c,d)]
-            self.adjuncts.append(np.array(operations))  # [(t,3)]
+            self.inputs.append(np.array(frames, dtype='float32'))  # [(t,c,d)]
+            self.adjuncts.append(np.array(operations, dtype='int32'))  # [(t,3)]
 
     def __len__(self):
         return len(self.inputs)
 
     def __getitem__(self, i):
-        return self.inputs[i], self.adjuncts[i]
+        return pt.from_numpy(self.inputs[i]), pt.from_numpy(self.adjuncts[i])
 
     @staticmethod
     def coordinate_operation(state, number1, number2, operation):

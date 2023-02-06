@@ -52,14 +52,11 @@ class SelectAttention(nn.Module):
 class RuleNetwork(nn.Module):
 
     def __init__(self,
-            cv, nv, nr=4, cr=64
+            nr, cr, nv, cv
     ):
         super().__init__()
-        self.device = pt.device('cuda') if pt.cuda.is_available() else pt.device('cpu')
-
-        w = pt.randn(1, nr, cr).to(self.device)
-        self.rule_embeddings = nn.Parameter(w)  # XXX better init? orth seems not useful
-        self.rule_mlp = nn.Sequential(GLinear(cv, 128, nr), nn.Dropout(0.1), nn.ReLU(), GLinear(128, cv, nr))
+        self.rule_embeds = nn.Parameter(pt.randn(nr, cr))  # XXX better init? orth init seems not useful
+        self.rule_mlps = nn.Sequential(GLinear(cv, 128, nr), nn.Dropout(0.1), nn.ReLU(), GLinear(128, cv, nr))
 
         self.dropout = nn.Dropout(p=0.1)  # XXX seems effective
 
@@ -74,9 +71,12 @@ class RuleNetwork(nn.Module):
 
     def forward(self, hidden):
         b, nv, cv = hidden.size()
-        rule_emb = self.rule_embeddings.repeat(b, 1, 1)
+        nr, cr = self.rule_embeds.size()
+        rule_embeds = self.rule_embeds[None, :, :].repeat(b, 1, 1)
 
-        q1 = rule_emb
+        # 1 # select rule and primary
+
+        q1 = rule_embeds
         k1 = hidden
         attent1 = self.dropout(self.selector1(q1, k1))
         shape1 = attent1.shape
@@ -87,26 +87,30 @@ class RuleNetwork(nn.Module):
             mask1_ = argmax_onehot(attent1_, dim=1)
         mask1 = mask1_.view(*shape1)  # (b,nr,nv)
 
-        mask_r = mask1.sum(dim=2).unsqueeze(-1)
-        var_r = (rule_emb * mask_r).sum(dim=1)
+        mask_r = mask1.sum(dim=2)
+        var_r = (rule_embeds * mask_r[:, :, None]).sum(dim=1)
 
-        self.rule_selection.append(pt.argmax(mask_r.detach()[:, :, 0], dim=1).cpu().numpy())
+        self.rule_selection.append(pt.argmax(mask_r.detach(), dim=1).cpu().numpy())
 
-        q2 = var_r.unsqueeze(1)
+        # 2 # select context
+
+        q2 = var_r[:, None, :]
         k2 = hidden
-        attent2 = self.dropout(self.selector2(q2, k2)).squeeze(1)
+        attent2 = self.dropout(self.selector2(q2, k2))[:, 0, :]
         if self.training:
             mask2 = ptnf.gumbel_softmax(attent2, tau=0.5, hard=True, dim=1)
         else:
             mask2 = argmax_onehot(attent2, dim=1)
 
-        var_p = (hidden * mask2.unsqueeze(-1)).sum(dim=1)
+        var_p = (hidden * mask2[:, :, None]).sum(dim=1)
 
         self.primary_selection.append(pt.argmax(mask2.detach(), dim=1).cpu().numpy())
 
-        input = var_p.unsqueeze(1).repeat(1, rule_emb.size(1), 1)
-        output = self.rule_mlp(input)
-        output = (output * mask_r).sum(dim=1).unsqueeze(1)
+        # 3 # apply rule and update primary
+
+        input = var_p[:, None, :].repeat(1, nr, 1)
+        output = self.rule_mlps(input)
+        output = (output * mask_r[:, :, None]).sum(dim=1)
 
         return output
 
@@ -139,7 +143,7 @@ class MnistOperationNps(nn.Module):
         super(MnistOperationNps, self).__init__()
         self.encoder = self.build_encoder(1, 64, 64, cv)
         self.operation_rep = nn.Sequential(nn.Linear(4, 64), nn.ReLU(), nn.Linear(64, cv))
-        self.rule_network = RuleNetwork(cv, nv, nr=nr, cr=cr)
+        self.rule_network = RuleNetwork(nr, cr, nv, cv)
         self.decoder = self.build_decoder(cv, 8, 8, 1)
 
     def forward(self, frames, operations):
@@ -159,7 +163,7 @@ class MnistOperationNps(nn.Module):
         dec_outs = self.decoder(dec_ins.flatten(0, 1))
         dec_outs = dec_outs.view(b, t, *dec_outs.shape[1:])
 
-        return pt.sigmoid(dec_outs)
+        return dec_outs
 
     @staticmethod
     def build_encoder(ci, hi, wi, co):
@@ -181,5 +185,5 @@ class MnistOperationNps(nn.Module):
             Reshape([64, 8, 8]),
             nn.Conv2d(64, 128, 3, stride=1, padding=1), nn.PixelShuffle(2), nn.ELU(), LayerNorm(),
             nn.Conv2d(32, 64, 3, stride=1, padding=1), nn.PixelShuffle(2), nn.ELU(), LayerNorm(),
-            nn.Conv2d(16, co * 4, 5, stride=1, padding=2), nn.PixelShuffle(2),  # nn.Sigmoid()
+            nn.Conv2d(16, co * 4, 5, stride=1, padding=2), nn.PixelShuffle(2), nn.Sigmoid()
         )

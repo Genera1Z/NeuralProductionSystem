@@ -1,42 +1,21 @@
-import math
-
+import numpy as np
 import torch as pt
-import torch.autograd as pta
 import torch.nn as nn
 import torch.nn.functional as ptnf
 
 
-def argmax_onehot(x, dim):
+def argmax_onehot(x: pt.Tensor, dim: int):
     idx = x.argmax(dim=dim)
     onehot = pt.zeros_like(x).scatter_(dim, idx.unsqueeze(dim), 1.0)
     return onehot
 
 
-class ArgMax(pta.Function):
-
-    @staticmethod
-    def forward(ctx, input):
-        idx = pt.argmax(input, 1)
-        op = pt.zeros_like(input)
-        op.scatter_(1, idx[:, None], 1)
-        ctx.save_for_backward(op)
-        return op
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        op, = ctx.saved_tensors
-        grad_input = grad_output * op
-        return grad_input
-
-
 class GLinear(nn.Module):
 
-    def __init__(self,
-            din, dout, num_blocks, bias=True, a=None
-    ):
+    def __init__(self, din, dout, num_blocks, bias=True, a=None):
         super(GLinear, self).__init__()
         if a is None:
-            a = 1. / math.sqrt(dout)
+            a = 1. / np.sqrt(dout)
         self.weight = nn.Parameter(pt.FloatTensor(num_blocks, din, dout).uniform_(-a, a))
         self.bias = bias
         if bias is True:
@@ -53,62 +32,36 @@ class GLinear(nn.Module):
         return x
 
 
-class GMlpD2(nn.Sequential):
-
-    def __init__(self,
-            ci, co, num, cm=128
-    ):
-        super(GMlpD2, self).__init__(
-            GLinear(ci, cm, num), nn.ReLU(), GLinear(cm, co, num)
-        )
-
-
-class MlpD2(nn.Sequential):
-
-    def __init__(self, ci, co, cm=32):
-        super(MlpD2, self).__init__(
-            nn.Linear(ci, cm), nn.ReLU(), nn.Linear(cm, co)
-        )
-
-
 class SelectAttention(nn.Module):
 
-    def __init__(self,
-            cq, ck, cm=16, nq=5, nk=5, share_q=False, share_k=False
-    ):
+    def __init__(self, cq, ck, cm=16, nq=5, nk=5, share_q=False, share_k=False):
         super(SelectAttention, self).__init__()
-        if not share_q:
-            self.proj_q = GLinear(cq, cm, nq)
-        else:
-            self.proj_q = nn.Linear(cq, cm)
-        if not share_k:
-            self.proj_k = GLinear(ck, cm, nk)
-        else:
-            self.proj_k = nn.Linear(ck, cm)
-        self.temperature = math.sqrt(cm)  # 32^0.5
+        self.proj_q = nn.Linear(cq, cm) if share_q else GLinear(cq, cm, nq)
+        self.proj_k = nn.Linear(ck, cm) if share_k else GLinear(ck, cm, nk)
+        self.temperature = np.sqrt(cm)
 
     def forward(self, q, k):
-        read = self.proj_q(q)
-        write = self.proj_k(k)
-        attent = pt.bmm(read, write.permute(0, 2, 1)) / self.temperature
-        return attent
+        r = self.proj_q(q)
+        w = self.proj_k(k)
+        a = pt.bmm(r, w.permute(0, 2, 1)) / self.temperature
+        return a
 
 
-class ArithmeticNps(nn.Module):
+class SequentialArithmeticNps(nn.Module):
 
     def __init__(self,
-            cv, n_rule, cr, share=(True, False, False, False)  # XXX at most ``share=TTTF`` works
+            nr, cr, nv, cv
     ):
         super().__init__()
-        self.encoder_operand = MlpD2(2, cv, cm=64)
-        self.encoder_operator = MlpD2(3, cv, cm=64)
+        self.encoder_operand = nn.Sequential(nn.Linear(2, 64), nn.ReLU(), nn.Linear(64, cv))
+        self.encoder_operator = nn.Sequential(nn.Linear(3, 64), nn.ReLU(), nn.Linear(64, cv))
         # self.decoder_operand = MlpL2(cv, 1, cm=64)  # TODO
 
-        self.rules_body = nn.Parameter(pt.randn(n_rule, cr))
-        self.rules_head = GMlpD2(2 * cv, 1, n_rule, 128)
+        self.rules_body = nn.Parameter(pt.randn(nr, cr))
+        self.rules_head = nn.Sequential(GLinear(2 * cv, 128, nr), nn.ReLU(), GLinear(128, 1, nr))
 
-        self.selector1 = SelectAttention(cv, cr, 32, nq=3, nk=n_rule, share_q=share[0], share_k=share[1])
-        self.selector2 = SelectAttention(cv, cv, 16, nq=1, nk=2, share_q=share[2], share_k=share[3])  # TODO XXX cr+cv
+        self.selector1 = SelectAttention(cv, cr, 32, nq=3, nk=nr, share_q=True, share_k=True)
+        self.selector2 = SelectAttention(cv, cv, 16, nq=1, nk=2, share_q=True, share_k=False)  # TODO XXX cr+cv
 
         print(self)
 

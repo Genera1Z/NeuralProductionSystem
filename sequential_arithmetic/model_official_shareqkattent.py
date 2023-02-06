@@ -1,36 +1,21 @@
-import math
-
+import numpy as np
 import torch as pt
-import torch.autograd as pta
 import torch.nn as nn
 import torch.nn.functional as ptnf
 
 
-class ArgMax(pta.Function):
-
-    @staticmethod
-    def forward(ctx, input):
-        idx = pt.argmax(input, 1)
-        op = pt.zeros_like(input)
-        op.scatter_(1, idx[:, None], 1)
-        ctx.save_for_backward(op)
-        return op
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        op, = ctx.saved_tensors
-        grad_input = grad_output * op
-        return grad_input
+def argmax_onehot(x: pt.Tensor, dim: int):
+    idx = x.argmax(dim=dim)
+    onehot = pt.zeros_like(x).scatter_(dim, idx.unsqueeze(dim), 1.0)
+    return onehot
 
 
 class GLinear(nn.Module):
 
-    def __init__(self,
-            din, dout, num_blocks, bias=True, a=None
-    ):
+    def __init__(self, din, dout, num_blocks, bias=True, a=None):
         super(GLinear, self).__init__()
         if a is None:
-            a = 1. / math.sqrt(dout)
+            a = 1. / np.sqrt(dout)
         self.weight = nn.Parameter(pt.FloatTensor(num_blocks, din, dout).uniform_(-a, a))
         self.bias = bias
         if bias is True:
@@ -47,72 +32,42 @@ class GLinear(nn.Module):
         return x
 
 
-class GMlpL2(nn.Sequential):
-
-    def __init__(self,
-            ci, co, num, cm=128
-    ):
-        super(GMlpL2, self).__init__(
-            GLinear(ci, cm, num), nn.ReLU(), GLinear(cm, co, num)
-        )
-
-
-class MlpL2(nn.Sequential):
-
-    def __init__(self, ci, co, cm=32):
-        super(MlpL2, self).__init__(
-            nn.Linear(ci, cm), nn.ReLU(), nn.Linear(cm, co)
-        )
-
-
 class SelectAttention(nn.Module):
 
-    def __init__(self,
-            cq, ck, cm=16, nq=5, nk=5, share_q=False, share_k=False
-    ):
+    def __init__(self, cq, ck, cm=16, nq=5, nk=5, share_q=False, share_k=False):
         super(SelectAttention, self).__init__()
-        if not share_q:  # V
-            self.proj_q = GLinear(ck, cm, nk)
-        else:
-            self.proj_q = nn.Linear(ck, cm)
-
-        if not share_k:
-            self.proj_k = GLinear(cq, cm, nq)
-        else:  # V
-            self.proj_k = nn.Linear(cq, cm)
-
-        self.temperature = math.sqrt(cm)  # 32^0.5
+        self.proj_q = nn.Linear(cq, cm) if share_q else GLinear(cq, cm, nq)
+        self.proj_k = nn.Linear(ck, cm) if share_k else GLinear(ck, cm, nk)
+        self.temperature = np.sqrt(cm)
 
     def forward(self, q, k):
-        read = self.proj_k(q)
-        write = self.proj_q(k)
-        attent = pt.bmm(read, write.permute(0, 2, 1)) / self.temperature
-        return attent
+        r = self.proj_q(q)
+        w = self.proj_k(k)
+        a = pt.bmm(r, w.permute(0, 2, 1)) / self.temperature
+        return a
 
 
-class ArithmeticNps(nn.Module):
+class SequentialArithmeticNps(nn.Module):
 
     def __init__(self,
-            cv, n_rule, cr, share=(True, False, False, False)  # XXX at most ``share=TTTF`` works
+            nr, cr, nv, cv
     ):
         super().__init__()
-        self.encoder_operand = MlpL2(2, cv, cm=64)
-        self.encoder_operator = MlpL2(3, cv, cm=64)
+        self.encoder_operand = nn.Sequential(nn.Linear(2, 64), nn.ReLU(), nn.Linear(64, cv))
+        self.encoder_operator = nn.Sequential(nn.Linear(3, 64), nn.ReLU(), nn.Linear(64, cv))
         # self.decoder_operand = MlpL2(cv, 1, cm=64)  # TODO
 
-        self.rules_body = nn.Parameter(pt.randn(1, n_rule, cr))
-        self.rules_head = GMlpL2(2 * cv, 1, n_rule, 128)
+        self.rules_body = nn.Parameter(pt.randn(1, nr, cr))
+        self.rules_head = nn.Sequential(GLinear(2 * cv, 128, nr), nn.ReLU(), GLinear(128, 1, nr))
 
-        self.selector1 = SelectAttention(cr, cv, 32, nq=n_rule, nk=3, share_q=share[0], share_k=share[1])  # XXX T, F
-        self.selector2 = SelectAttention(cr, cv, 16, nq=2, nk=2, share_q=share[2], share_k=share[3])  # XXX F, F
+        self.selector1 = SelectAttention(cr, cv, 32, nq=nr, nk=3, share_q=True, share_k=True)
+        self.selector2 = SelectAttention(cr, cv, 16, nq=2, nk=2, share_q=True, share_k=False)
 
         print(self)
 
         self.rule_selection = []
-        self.variable_activation = []
-        self.variable_activation_1 = []
-        self.rule_probabilities = []
-        self.variable_probabilities = []
+        self.primary_selection = []
+        self.context_selection = []
 
     def forward(self, operand1, operand2, operator):  # (20,1) (20,1) (20,3)
         x1c = self.wrap_operand(operand1, 0)
@@ -134,8 +89,7 @@ class ArithmeticNps(nn.Module):
             mask = prob1_.view(shape_a1)
         else:
             prob1_ = ptnf.softmax(attent1_, dim=1)
-            mask = ArgMax().apply(prob1_).view(shape_a1)
-        self.rule_probabilities.append(prob1_.detach().view(shape_a1))
+            mask = argmax_onehot(prob1_, dim=1).view(shape_a1)
 
         rule_mask = mask.sum(dim=2, keepdim=True)  # (b,nr,1)
         self.rule_selection.append(pt.argmax(rule_mask.detach()[:, :, 0], dim=1).cpu().numpy())
@@ -150,9 +104,7 @@ class ArithmeticNps(nn.Module):
             mask21, mask22 = [prob2[:, _, :] for _ in range(2)]
         else:
             prob2 = ptnf.softmax(attent2, dim=2)
-            # mask2 = ArgMax().apply(attent2)
-            # mask2 = pt.stack([ArgMax().apply(attent2[:, _, :]) for _ in range(2)], dim=1)
-            mask21, mask22 = [ArgMax().apply(prob2[:, _, :]) for _ in range(2)]
+            mask21, mask22 = [argmax_onehot(prob2[:, _, :], dim=1) for _ in range(2)]
         """
         SEQUENCE LENGTH	|	MSE
 	      10        |	0.0002
@@ -161,8 +113,8 @@ class ArithmeticNps(nn.Module):
 	      40        |	0.0018
 	      50        |	0.0027
         """
-        self.variable_activation.append(pt.argmax(mask21.detach(), dim=1).cpu().numpy())
-        self.variable_activation_1.append(pt.argmax(mask22.detach(), dim=1).cpu().numpy())
+        self.primary_selection.append(pt.argmax(mask21.detach(), dim=1).cpu().numpy())
+        self.context_selection.append(pt.argmax(mask22.detach(), dim=1).cpu().numpy())
 
         var_p = (hidden * mask21[:, :, None]).sum(dim=1)  # (b,nv)
         var_c = (hidden * mask22[:, :, None]).sum(dim=1)  # (b,nv)
@@ -174,11 +126,9 @@ class ArithmeticNps(nn.Module):
         return output
 
     def reset(self):
-        self.rule_selection = []
-        self.variable_activation = []
-        self.variable_activation_1 = []
-        self.rule_probabilities = []
-        self.variable_probabilities = []
+        self.rule_selection.clear()
+        self.primary_selection.clear()
+        self.context_selection.clear()
 
     @staticmethod
     def wrap_operand(xi, flag):

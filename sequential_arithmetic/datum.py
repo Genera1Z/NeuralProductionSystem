@@ -3,7 +3,7 @@ import torch as pt
 import torch.utils.data as ptud
 
 
-class ArithmeticSet(ptud.Dataset):
+class SequentialArithmeticSet(ptud.Dataset):
     OP_SET = (np.add, np.subtract, np.multiply)
 
     def __init__(self, length, n_xmpl):
@@ -51,7 +51,7 @@ class ArithmeticSet(ptud.Dataset):
 
 
 def main():
-    xmpls = ArithmeticSet(20, 25600)
+    xmpls = SequentialArithmeticSet(20, 25600)
     for _ in xmpls:
         inp, tar, op = [_[:, i] for i in range(3)]
         tar_ = np.concatenate([np.zeros([1]), tar[:-1]])
